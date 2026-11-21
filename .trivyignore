@@ -1,0 +1,16 @@
+# Accepted trivy config findings (HIGH/CRITICAL). Each entry is a design choice documented in ARCHITECTURE.md/README.md;
+# remove the entry when the choice changes. Used by the CI trivy step (trivyignores) and locally:
+#   trivy config --severity HIGH,CRITICAL --ignorefile .trivyignore .
+
+# SNS topics of app data use the AWS-managed key (alias/aws/sns) when no kms_key_arn is given (modules/event-topic).
+AVD-AWS-0136
+
+# SQS queues of app data use SSE-SQS (AWS-managed) when no kms_key_arn is given (modules/messaging-queue).
+AVD-AWS-0135
+
+# S3 app buckets use SSE-S3 (AWS-managed) when no kms_key_arn is given (modules/app-bucket).
+AVD-AWS-0132
+
+# EKS node security group egress 0.0.0.0/0 (community eks module): nodes pull images and call AWS APIs through
+# the NAT because there are no VPC endpoints yet (known gap in README.md).
+AVD-AWS-0104

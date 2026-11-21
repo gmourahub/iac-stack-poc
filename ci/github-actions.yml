@@ -1,0 +1,308 @@
+# Example pipeline. Copy to .github/workflows/infra.yml in a repo whose root is this estate (tmp/).
+#
+# PR:   offline checks only (no cloud credentials).
+# main: offline checks -> per environment, a plan job then an apply job: staging, then the same commit to prod.
+#   plan job:  deploy.sh plan (writes <env>.tfplan and runs the destructive-change gate scripts/check-plan.sh),
+#              plan text in the job summary, plan file + text uploaded as an artifact.
+#   apply job: downloads that exact plan artifact and applies it (deploy.sh apply). A plan made stale by another
+#              apply in between fails ("Saved plan is stale") instead of applying something nobody saw.
+# Build once, deploy many: every job checks out the same github.sha and init honours the committed
+# .terraform.lock.hcl read-only (TF_CLI_ARGS_init in the deploy jobs), so staging and prod run identical code and provider builds.
+#
+# Deletes/replaces: check-plan.sh fails the plan job. To let a reviewed delete through, run this workflow by hand
+# (workflow_dispatch on main, allow_destroy = true): it re-plans the stacks changed by the last commit on main with
+# ALLOW_DESTROY=true. Only do it after the deletes were reviewed in the blocked run's plan; prod still needs approval.
+#
+# GitHub setup: environments "staging" and "production" (production with required reviewers; names must match
+# deploy_targets in stacks/shared-services, which pins the OIDC trust to them), each with variables
+#   AWS_DEPLOY_ROLE_ARN = OIDC role acme-shared-deploy-<env> in acme-shared (output of stacks/shared-services)
+#   AWS_TARGET_ROLE_ARN = role acme-<env>-deploy in the target account (output of stacks/account-baseline)
+# Role chain: OIDC -> acme-shared-deploy-<env> -> acme-<env>-deploy. Stacks take credentials from the
+# environment, so the chaining happens here. Chained sessions are capped at 1 hour, per job: plan and apply are
+# separate jobs (one stack each), so each gets its own hour.
+#
+# Prod approvals: the prod OIDC trust only accepts jobs in the "production" environment, so the prod plan job runs
+# there too and needs one approval to start (it only plans); the prod apply job needs a second approval, given
+# after reading that plan in the summary. shortcut: two approvals; to plan without one, add a read-only plan role
+# with its own GitHub environment (e.g. production-plan) to the OIDC trust in stacks/shared-services.
+#
+# Actions are pinned to commit SHAs (tag in the comment); bump them with the tag -> SHA lookup, never to a branch.
+name: infra
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      allow_destroy:
+        description: "Let plans that delete/replace resources through (ALLOW_DESTROY=true). Only after reviewing them."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: 1.13.5
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.59.1
+
+      - name: fmt
+        run: terraform fmt -check -recursive
+
+      - name: validate
+        run: |
+          for dir in modules/*/ stacks/*/ apps/*/; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - name: tflint
+        run: |
+          tflint --init --config "$PWD/.tflint.hcl"
+          tflint --recursive --config "$PWD/.tflint.hcl"
+
+      - name: trivy config
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          trivyignores: .trivyignore # accepted design choices, each with its justification
+
+      - name: terraform test (modules, mock providers, offline)
+        run: |
+          for dir in modules/*/; do
+            echo "::group::test $dir"
+            terraform -chdir="$dir" test
+            echo "::endgroup::"
+          done
+
+      - name: script tests
+        run: scripts/check-plan_test.sh
+
+  changes:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: offline
+    runs-on: ubuntu-latest
+    outputs:
+      stacks: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # Filter names are stack dirs, listed in deploy order; a module change redeploys every app using modules.
+      # Only stacks deployed to staging/prod belong here (bootstrap, organization, shared-services have their own flow).
+      - id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            stacks/network: [stacks/network/**]
+            stacks/eks-platform: [stacks/eks-platform/**]
+            apps/orders: [apps/orders/**, modules/**]
+            apps/payments: [apps/payments/**, modules/**]
+            apps/notifications: [apps/notifications/**, modules/**]
+            apps/catalog: [apps/catalog/**, modules/**]
+
+  # shortcut: all plans of an environment run before its first apply, so a stack reading SSM values that an
+  # upstream stack changes in the same push (network -> eks -> apps) is planned against the old values.
+  # Push such upstream changes on their own (or re-run after the upstream apply); use a per-stack DAG if it bites.
+  plan-staging:
+    needs: changes
+    if: needs.changes.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: staging-${{ matrix.stack }} # plan locks the state too
+      cancel-in-progress: false
+    env:
+      TF_CLI_ARGS_init: -lockfile=readonly # fail instead of re-resolving providers
+      ALLOW_DESTROY: ${{ inputs.allow_destroy && 'true' || 'false' }}
+      STACK: ${{ matrix.stack }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false # show every stack's plan
+      matrix:
+        stack: ${{ fromJSON(needs.changes.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_TARGET_ROLE_ARN }}
+          role-chaining: true
+          aws-region: us-east-1
+      - id: artifact
+        run: echo "name=plan-staging-${STACK//\//-}" >> "$GITHUB_OUTPUT"
+      - run: scripts/deploy.sh "$STACK" staging plan
+      - name: plan summary
+        if: ${{ !cancelled() && hashFiles(format('{0}/staging.tfplan', matrix.stack)) != '' }}
+        # shortcut: summary capped below GitHub's 1 MiB step limit; the full text is in the artifact.
+        run: |
+          terraform -chdir="$STACK" show -no-color staging.tfplan > "$STACK/staging.tfplan.txt"
+          { echo "### $STACK (staging)"; echo '```'; head -c 900000 "$STACK/staging.tfplan.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          # The plan file holds sensitive values in clear text: short retention, repo-scoped artifact.
+          path: |
+            ${{ matrix.stack }}/staging.tfplan
+            ${{ matrix.stack }}/staging.tfplan.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  apply-staging:
+    needs: [changes, plan-staging]
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: staging-${{ matrix.stack }}
+      cancel-in-progress: false
+    env:
+      TF_CLI_ARGS_init: -lockfile=readonly # fail instead of re-resolving providers
+      STACK: ${{ matrix.stack }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      # shortcut: one stack at a time in filter order to respect deploy order; use a DAG (needs per stack) if it gets slow.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        stack: ${{ fromJSON(needs.changes.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_TARGET_ROLE_ARN }}
+          role-chaining: true
+          aws-region: us-east-1
+      - id: artifact
+        run: echo "name=plan-staging-${STACK//\//-}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ matrix.stack }}
+      - run: scripts/deploy.sh "$STACK" staging apply
+
+  plan-prod:
+    needs: [changes, apply-staging]
+    runs-on: ubuntu-latest
+    environment: production # the prod OIDC trust requires it, so this job needs an approval too (see header)
+    concurrency:
+      group: prod-${{ matrix.stack }}
+      cancel-in-progress: false
+    env:
+      TF_CLI_ARGS_init: -lockfile=readonly # fail instead of re-resolving providers
+      ALLOW_DESTROY: ${{ inputs.allow_destroy && 'true' || 'false' }}
+      STACK: ${{ matrix.stack }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.changes.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_TARGET_ROLE_ARN }}
+          role-chaining: true
+          aws-region: us-east-1
+      - id: artifact
+        run: echo "name=plan-prod-${STACK//\//-}" >> "$GITHUB_OUTPUT"
+      - run: scripts/deploy.sh "$STACK" prod plan
+      - name: plan summary
+        if: ${{ !cancelled() && hashFiles(format('{0}/prod.tfplan', matrix.stack)) != '' }}
+        run: |
+          terraform -chdir="$STACK" show -no-color prod.tfplan > "$STACK/prod.tfplan.txt"
+          { echo "### $STACK (prod)"; echo '```'; head -c 900000 "$STACK/prod.tfplan.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: |
+            ${{ matrix.stack }}/prod.tfplan
+            ${{ matrix.stack }}/prod.tfplan.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  apply-prod:
+    needs: [changes, plan-prod]
+    runs-on: ubuntu-latest
+    environment: production # required reviewers approve here, after reading the plan-prod summary; same github.sha as staging
+    concurrency:
+      group: prod-${{ matrix.stack }}
+      cancel-in-progress: false
+    env:
+      TF_CLI_ARGS_init: -lockfile=readonly # fail instead of re-resolving providers
+      STACK: ${{ matrix.stack }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        stack: ${{ fromJSON(needs.changes.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_TARGET_ROLE_ARN }}
+          role-chaining: true
+          aws-region: us-east-1
+      - id: artifact
+        run: echo "name=plan-prod-${STACK//\//-}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ matrix.stack }}
+      - run: scripts/deploy.sh "$STACK" prod apply

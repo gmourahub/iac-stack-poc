@@ -1,0 +1,9 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.13.5",
+  "resource_changes": [
+    {"address": "aws_sqs_queue.orders", "change": {"actions": ["create"]}},
+    {"address": "aws_db_instance.main", "change": {"actions": ["delete", "create"]}},
+    {"address": "aws_sns_topic.old", "change": {"actions": ["delete"]}}
+  ]
+}

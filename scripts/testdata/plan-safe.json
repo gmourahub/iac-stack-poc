@@ -1,0 +1,9 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.13.5",
+  "resource_changes": [
+    {"address": "aws_sqs_queue.orders", "change": {"actions": ["create"]}},
+    {"address": "aws_ssm_parameter.endpoint", "change": {"actions": ["update"]}},
+    {"address": "aws_s3_bucket.data", "change": {"actions": ["no-op"]}}
+  ]
+}

@@ -1,0 +1,5 @@
+bucket       = "acme-tfstate-staging"
+key          = "stacks/eks-platform/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
